@@ -1,5 +1,5 @@
 # The things to improve
 
-- Improve precision of the histogram wavenumber axes
-- Gating for ToF?
-- Bin accumulation stops if motor needs to move
+- [DONE] Improve precision of the histogram wavenumber axes
+- [DONE] Gating for ToF?
+- [DONE] Bin accumulation stops if motor needs to move

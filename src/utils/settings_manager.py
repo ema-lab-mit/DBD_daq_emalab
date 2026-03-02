@@ -34,6 +34,25 @@ class SettingsManager:
             "multimeter": {
                 "noise_level": 0.05
             }
+        },
+        "control_settings": {
+            "laser": {
+                "controller_mode": "pid",
+                "tolerance": 0.007,
+                "poll_interval": 0.01,
+                "required_stable_samples": 4,
+                "wavechannel": 1,
+                "voltage_min": 0.0,
+                "voltage_max": 5.0,
+                "step_fine": 0.001,
+                "step_coarse": 0.005,
+                "pid": {
+                    "kp": 0.02,
+                    "ki": 0.005,
+                    "kd": 0.0,
+                    "d_filter_coeff": 0.1
+                }
+            }
         }
     }
 

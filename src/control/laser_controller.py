@@ -1,11 +1,14 @@
 import time
 import threading
 from src.simulation.hardware_mocks import MockPIGCSDevice, MockEpicsClient
+from src.control.pid import PIDController
 
 class LaserController:
     """
     Encapsulates the logic from the 'go_to' script to control the Laser
     via a PI Stage and a Wavemeter (EPICS).
+
+    Supports two controller modes: 'pid' and 'bangbang'.
     """
     def __init__(self, pi_device, epics_client, axis=1, config: dict = {}):
         self.device = pi_device
@@ -21,9 +24,24 @@ class LaserController:
         self.coarse_approach_thresh = self.config.get("coarse_approach_threshold", 1.0)
         self.required_stable_samples = self.config.get("required_stable_samples", 4)
 
+        # Controller mode and voltage limits
+        self.controller_mode = self.config.get("controller_mode", "pid")
+        self.voltage_min = self.config.get("voltage_min", 0.0)
+        self.voltage_max = self.config.get("voltage_max", 5.0)
+
+        # PID controller
+        pid_config = self.config.get("pid", {})
+        self.pid = PIDController(
+            kp=pid_config.get("kp", 0.02),
+            ki=pid_config.get("ki", 0.005),
+            kd=pid_config.get("kd", 0.0),
+            d_filter_coeff=pid_config.get("d_filter_coeff", 0.1),
+        )
+
         self.target_wn = 0.0
         self.current_wn = 0.0
         self.is_moving = False
+        self.voltage_limited = False
 
         # Threading for the control loop
         self.lock = threading.Lock()
@@ -42,7 +60,22 @@ class LaserController:
             self.poll_interval = self.config.get("poll_interval", 0.5)
             self.coarse_approach_thresh = self.config.get("coarse_approach_threshold", 1.0)
             self.required_stable_samples = self.config.get("required_stable_samples", 4)
-            print(f"[LaserController] Config updated: tol={self.tolerance}, poll={self.poll_interval}")
+
+            self.controller_mode = self.config.get("controller_mode", self.controller_mode)
+            self.voltage_min = self.config.get("voltage_min", self.voltage_min)
+            self.voltage_max = self.config.get("voltage_max", self.voltage_max)
+
+            pid_config = self.config.get("pid", {})
+            if pid_config:
+                self.pid.update_gains(
+                    kp=pid_config.get("kp"),
+                    ki=pid_config.get("ki"),
+                    kd=pid_config.get("kd"),
+                    d_filter_coeff=pid_config.get("d_filter_coeff"),
+                )
+
+            print(f"[LaserController] Config updated: mode={self.controller_mode}, "
+                  f"tol={self.tolerance}, poll={self.poll_interval}")
 
     def set_wavenumber(self, target_wn):
         """
@@ -51,6 +84,8 @@ class LaserController:
         with self.lock:
             self.target_wn = target_wn
             self.stop_event.clear()
+            self.pid.reset()
+            self.voltage_limited = False
 
             if self.control_thread and self.control_thread.is_alive():
                  # Already running, just updated target
@@ -81,65 +116,85 @@ class LaserController:
         if self.control_thread:
             self.control_thread.join()
 
+    def _compute_bangbang(self, current_wn, current_voltage):
+        """Compute next voltage using bang-bang (coarse/fine step) logic."""
+        step_fine = self.step_fine
+        step_coarse = self.step_coarse
+        voltage_cmd = 0.0
+
+        if current_wn >= self.target_wn + self.tolerance:
+            if abs((current_voltage - step_fine) - self._prev_voltage) > 1e-9:
+                voltage_cmd = current_voltage + step_fine
+            else:
+                voltage_cmd = current_voltage - step_coarse
+        else:
+            if abs((current_voltage + step_fine) - self._prev_voltage) > 1e-9:
+                voltage_cmd = current_voltage - step_fine
+            else:
+                voltage_cmd = current_voltage + step_coarse
+
+        return voltage_cmd
+
+    def _compute_pid(self, current_wn, current_voltage):
+        """Compute next voltage using PID controller."""
+        adjustment = self.pid.compute(self.target_wn, current_wn, self.poll_interval)
+        return current_voltage + adjustment
+
+    def _clamp_voltage(self, voltage):
+        """Clamp voltage to configured limits."""
+        return max(self.voltage_min, min(self.voltage_max, voltage))
+
     def _control_loop(self):
         """
-        The logic from 'go_to' script.
+        Main control loop dispatching to PID or bang-bang strategy.
         """
-        print(f"[LaserController] Starting control loop for Target {self.target_wn}")
-        # try:
-        # 1. Read initial state
-        wn = self.get_wavenumber()
-        position = self.device.qPOS(self.axis)[self.axis]
-        # time.sleep(1)
-        # print(position)
-        prevpos = position
+        print(f"[LaserController] Starting control loop for Target {self.target_wn} "
+              f"(mode={self.controller_mode})")
 
-        # 2. Control Loop with Stability Check
+        wn = self.get_wavenumber()
+        voltage = self.device.qPOS(self.axis)[self.axis]
+        self._prev_voltage = voltage
+
         stable_samples = 0
         REQUIRED_STABLE_SAMPLES = self.required_stable_samples
 
         while not self.stop_event.is_set():
             wn = self.get_wavenumber()
-            position = self.device.qPOS(self.axis)[self.axis]
+            voltage = self.device.qPOS(self.axis)[self.axis]
 
             # Check stability
             if abs(wn - self.target_wn) < self.tolerance:
                 stable_samples += 1
-                print(f"[LaserController] Within tolerance.. stabilizing ({stable_samples}/{REQUIRED_STABLE_SAMPLES})")
+                print(f"[LaserController] Within tolerance.. stabilizing "
+                      f"({stable_samples}/{REQUIRED_STABLE_SAMPLES})")
                 if stable_samples >= REQUIRED_STABLE_SAMPLES:
                     break
 
-                # Small dwell time to ensure we aren't just flying by
                 time.sleep(0.5)
                 continue
             else:
-                stable_samples = 0 # Reset if we pop out of tolerance
+                stable_samples = 0
 
-            step_fine = self.step_fine
-            step_coarse = self.step_coarse
-            move_cmd = 0.0
-
-            if wn >= self.target_wn + self.tolerance:
-                # WN is too high, need to decrease it (decrease position)
-                if abs((position - step_fine) - prevpos) > 1e-9:
-                    move_cmd = position + step_fine
-                else:
-                    move_cmd = position - step_coarse
+            # Dispatch to controller strategy
+            if self.controller_mode == "pid":
+                voltage_cmd = self._compute_pid(wn, voltage)
             else:
-                # WN is too low, need to increase it (increase position)
-                if abs((position + step_fine) - prevpos) > 1e-9:
-                    move_cmd = position - step_fine
-                else:
-                    move_cmd = position +step_coarse
+                voltage_cmd = self._compute_bangbang(wn, voltage)
 
-            self.device.MOV(self.axis, move_cmd)
+            # Clamp voltage to physical limits
+            clamped = self._clamp_voltage(voltage_cmd)
+            if clamped != voltage_cmd:
+                self.voltage_limited = True
+            voltage_cmd = clamped
 
-            # Wait for move to complete (or user stop)
-            if self.stop_event.wait(0.5):
+            self.device.MOV(self.axis, voltage_cmd)
+
+            if self.stop_event.wait(self.poll_interval):
                 break
 
-            prevpos = position
-            print(f"[LaserController] Pos: {position:.5f}, WN: {wn:.4f} (Target: {self.target_wn})")
+            self._prev_voltage = voltage
+            print(f"[LaserController] V: {voltage:.5f}, WN: {wn:.4f} "
+                  f"(Target: {self.target_wn})")
 
         print(f"[LaserController] Target reached or stopped. Final WN: {wn:.4f}")
         self.is_moving = False

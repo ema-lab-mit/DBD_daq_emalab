@@ -88,12 +88,13 @@ class DAQSystem:
         self.sensor_lock = threading.Lock()
 
         self.last_scan_filename = None
+        self.tof_online_mode = False
 
     def start(self):
         if self.running: return
         print("[DAQ] Starting system...")
         self.running = True
-        self.tof_buffer = []
+        self.tof_buffer = deque(maxlen=50000)
 
         self.spec_reader.start()
         self.multimeter.start()
@@ -172,7 +173,7 @@ class DAQSystem:
 
         self.scanner.configure(start_wn, end_wn, step, stop_mode, stop_value, loops, self._on_loop_complete)
         self.scanner.reset()
-        self.tof_buffer = [] # Clear buffer on new scan
+        self.tof_buffer = deque(maxlen=50000) # Clear buffer on new scan
 
         self.scanner.start()
 
@@ -251,6 +252,8 @@ class DAQSystem:
                         if entry[0] != previous_bunch2:
                             self.scanner.report_event(is_bunch=True)
                             previous_bunch2 = entry[0]
+                    elif self.tof_online_mode:
+                        self.tof_buffer.append(entry[3])
 
             time.sleep(self.config["gui_settings"]["refresh_rate_ms"]/1000)
 

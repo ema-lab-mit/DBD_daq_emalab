@@ -1,11 +1,12 @@
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QGroupBox, QListWidget, QListWidgetItem, QAbstractItemView, QCheckBox, QLabel)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QGroupBox, QListWidget, QListWidgetItem, QAbstractItemView, QCheckBox, QLabel, QSpinBox, QHBoxLayout)
 from PyQt5.QtCore import pyqtSignal, Qt
-from PyQt5.QtWidgets import QCheckBox
 
 class PlotOptionsWidget(QWidget):
     options_changed = pyqtSignal(list)
     auto_scale_toggled = pyqtSignal(bool)
     theme_toggled = pyqtSignal(bool) # True = Dark, False = Light
+    tof_online_toggled = pyqtSignal(bool)
+    tof_bins_changed = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -43,6 +44,26 @@ class PlotOptionsWidget(QWidget):
 
         layout_opts.addWidget(self.list_widget)
         layout.addWidget(grp_opts)
+
+        grp_tof = QGroupBox("ToF Settings")
+        layout_tof = QVBoxLayout()
+        grp_tof.setLayout(layout_tof)
+
+        self.chk_tof_online = QCheckBox("ToF Online Mode")
+        self.chk_tof_online.setChecked(False)
+        self.chk_tof_online.toggled.connect(self.tof_online_toggled.emit)
+        layout_tof.addWidget(self.chk_tof_online)
+
+        bins_row = QHBoxLayout()
+        bins_row.addWidget(QLabel("Bins:"))
+        self.spin_tof_bins = QSpinBox()
+        self.spin_tof_bins.setRange(10, 500)
+        self.spin_tof_bins.setValue(50)
+        self.spin_tof_bins.valueChanged.connect(self.tof_bins_changed.emit)
+        bins_row.addWidget(self.spin_tof_bins)
+        layout_tof.addLayout(bins_row)
+
+        layout.addWidget(grp_tof)
 
     def add_item(self, key, text, checked=False):
         item = QListWidgetItem(text)

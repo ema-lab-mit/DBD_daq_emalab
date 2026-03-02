@@ -3,6 +3,20 @@ from PyQt5.QtCore import Qt
 import pyqtgraph as pg
 import numpy as np
 
+class WavenumberAxis(pg.AxisItem):
+    """Axis that shows wavenumber tick labels with extra decimal precision."""
+    def tickStrings(self, values, scale, spacing):
+        if spacing > 0.1:
+            fmt = "{:.3f}"
+        elif spacing > 0.01:
+            fmt = "{:.4f}"
+        elif spacing > 0.001:
+            fmt = "{:.5f}"
+        else:
+            fmt = "{:.6f}"
+        return [fmt.format(v * scale) for v in values]
+
+
 class PlotWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -11,6 +25,7 @@ class PlotWidget(QWidget):
         self.active_options = ['rate', 'scan']
         self.auto_scale = True
         self.is_dark_mode = False
+        self.tof_bins = 50
 
         self.set_theme(False, layout_rebuild=False) # Init theme first
 
@@ -28,6 +43,9 @@ class PlotWidget(QWidget):
     def set_active_plots(self, options):
         self.active_options = options
         self.rebuild_plots()
+
+    def set_tof_bins(self, n):
+        self.tof_bins = n
 
     def set_auto_scale(self, enabled):
         self.auto_scale = enabled
@@ -73,7 +91,11 @@ class PlotWidget(QWidget):
         pen_color = 'g' if self.is_dark_mode else 'g'
 
         for key in self.active_options:
-            pw = pg.PlotWidget()
+            if key == 'scan':
+                wn_axis = WavenumberAxis(orientation='bottom')
+                pw = pg.PlotWidget(axisItems={'bottom': wn_axis})
+            else:
+                pw = pg.PlotWidget()
             pw.setMinimumHeight(30)
 
             self.splitter.addWidget(pw)
@@ -173,7 +195,7 @@ class PlotWidget(QWidget):
             tof_data = history.get('tof_buffer')
             if tof_data is not None: # Only update if provided
                 if len(tof_data) > 0:
-                    counts, bin_edges = np.histogram(tof_data, bins=50, density=True)
+                    counts, bin_edges = np.histogram(tof_data, bins=self.tof_bins, density=True)
                     self.curves['tof'].setData(bin_edges, counts)
                     self.plot_items['tof'].setTitle(f"ToF Histogram ({len(tof_data)} events)")
                 else:
