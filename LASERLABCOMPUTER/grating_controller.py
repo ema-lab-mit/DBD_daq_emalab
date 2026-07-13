@@ -18,6 +18,7 @@ if SIMULATION:
 else:
     try:
         from pipython import GCSDevice,pitools
+        from pipython.pidevice.gcserror import GCSError
         import epics
     except ImportError as e:
         print(f"[Server] Hardware libraries missing: {e}. Use SIMULATION=1 for testing.")
@@ -47,16 +48,56 @@ class LaserServerInterface:
             elif self.laser:
                 self.pi = GCSDevice(CONTROLLERNAME)
                 self.pi.ConnectRS232(comport=COM_PORT, baudrate=BAUD_RATE)
-                print(f"[Server] Connected: {self.pi.qIDN().strip()}")
-
-                self.pi.SVO(1, 1)
-                print("[Server] Servo enabled (Axis 1).")
-                print(self.pi.qPOS(1)[1])
+                # The Pollux GCS DLL can fire a spurious GCSError(0) on the first
+                # command after connect (stale error buffer). Drain it, then run
+                # the post-connect setup tolerantly so a harmless error does NOT
+                # reach the outer except and null self.pi -- which would silently
+                # break every MOV/qPOS afterwards (grating never moves, qPOS 0.0).
+                try:
+                    self.pi.qERR()
+                except GCSError:
+                    pass
+                try:
+                    print(f"[Server] Connected: {self.pi.qIDN().strip()}")
+                except GCSError as e:
+                    print(f"[Server] qIDN threw {e} (tolerated).")
+                self._enable_servo_tolerant()
+                try:
+                    print(f"[Server] Position (axis 1): {self.pi.qPOS(1)[1]}")
+                except GCSError as e:
+                    print(f"[Server] qPOS threw {e} (tolerated).")
             else:
                 self.sirah = Sirah.SirahMatisse("USB0::0x17E7::0x0102::24-50-09::INSTR")
         except Exception as e:
             print(f"[Server] CRITICAL HARDWARE ERROR: {e}")
             self.pi = None
+
+    def _enable_servo_tolerant(self):
+        """Enable the servo on axis 1, tolerating the spurious GCSError(0) the
+        Pollux GCS DLL fires on the first command after connect. Mirrors
+        jog_grating.py: drain qERR(), retry once, then verify the real servo
+        state (qSVO) rather than dying on a harmless error."""
+        try:
+            self.pi.SVO(1, 1)
+            print("[Server] Servo enabled (Axis 1).")
+            return
+        except GCSError as e:
+            pass
+        try:
+            self.pi.qERR()
+            self.pi.SVO(1, 1)  # one clean retry after draining the error buffer
+            print("[Server] Servo enabled (Axis 1) after retry.")
+            return
+        except GCSError as e2:
+            try:
+                servo_on = bool(self.pi.qSVO(1)[1])
+            except Exception:
+                servo_on = False
+            if servo_on:
+                print(f"[Server] SVO threw {e2}, but servo reads ON -- continuing.")
+            else:
+                print(f"[Server] WARNING: could not enable servo ({e2}); "
+                      "moves may be rejected. Continuing anyway.")
 
     def MOV(self, axis, target):
         print(f"[CMD] MOV Axis {axis} -> {target}")

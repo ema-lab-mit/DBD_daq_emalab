@@ -1,10 +1,10 @@
 {
     "scan_settings": {
-        "start_wn": 12628.95,
-        "end_wn": 12628.91,
+        "start_wn": 12625.09,
+        "end_wn": 12625.21,
         "step_size": 0.001,
         "stop_mode": "time",
-        "stop_val": 250.0,
+        "stop_val": 2.0,
         "loops": 1,
         "min_wn": 12625.18,
         "max_wn": 12625.21
@@ -28,13 +28,6 @@
             "move_speed": 500.0,
             "noise_level": 0.001
         },
-        "grating": {
-            "initial_wn": 12625.2,
-            "initial_pos": 0.35,
-            "wn_per_unit": -1.0,
-            "slew_rate": 0.5,
-            "noise_level": 0.001
-        },
         "epics": {
             "offset": 16666.0,
             "slope": 5.0,
@@ -42,22 +35,29 @@
         },
         "multimeter": {
             "noise_level": 0.05
+        },
+        "grating": {
+            "initial_wn": 12625.2,
+            "initial_pos": 0.35,
+            "wn_per_unit": -1.0,
+            "slew_rate": 0.5,
+            "noise_level": 0.001
         }
     },
     "control_settings": {
-        "laser_type": "matisse",
         "laser": {
             "tolerance": 0.0005,
             "goto_threshold": 0.01,
             "poll_interval": 0.2,
             "required_stable_samples": 4,
-            "wavechannel": 1,
+            "wavechannel": 3,
             "wm_averaging_samples": 5,
             "dialog_open_delay": 0.3,
             "activation_delay": 1.0,
             "setpoint_settle": 0.5,
             "continuous": false
         },
+        "laser_type": "grating",
         "grating": {
             "axis": 1,
             "tolerance": 0.0001,
