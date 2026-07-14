@@ -156,10 +156,11 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
         self.lbl_rate = QtWidgets.QLabel("gated rate: 0.0 /s")
         self.lbl_gate = QtWidgets.QLabel("gate: ---")
         self.lbl_dir = QtWidgets.QLabel("sweep dir: ---")
+        self.lbl_live = QtWidgets.QLabel("park live time: ---")
         self.lbl_folder = QtWidgets.QLabel("data: ---")
         self.lbl_folder.setWordWrap(True)
         for w in (self.lbl_status, self.lbl_wn, self.lbl_events, self.lbl_rate,
-                  self.lbl_gate, self.lbl_dir, self.lbl_folder):
+                  self.lbl_gate, self.lbl_dir, self.lbl_live, self.lbl_folder):
             panel.addWidget(w)
         panel.addStretch(1)
 
@@ -216,7 +217,11 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
         self.cfg["park_deadband"] = self.in_deadband.value()
         self.cfg["scan_velocity"] = self.in_scan_vel.value()
         minutes = self.in_minutes.value()
-        self.run_deadline = (time.time() + minutes * 60.0) if minutes > 0 else None
+        self.run_mode = mode
+        # Timed runs: survey counts wall time; park counts LIVE time (seconds
+        # actually spent inside the deadband).
+        self.run_seconds = minutes * 60.0 if minutes > 0 else None
+        self.run_wall_start = time.time()
         params = dict(self.cfg)
         params.update({"mode": mode, "wn_lo": wn_lo, "wn_hi": wn_hi,
                        "bin_width": self.in_bin.value(),
@@ -288,7 +293,8 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
                 extra = {"stopped": time.strftime("%Y%m%d_%H%M%S"),
                          "total_events": int(self.state.total_events),
                          "gated_events": int(self.state.gated_events),
-                         "gate": list(self.state.gate)}
+                         "gate": list(self.state.gate),
+                         "park_live_s": float(self.state.park_live_s)}
             self.recorder.close(extra)
         self.lbl_status.setText("stopped")
         self.btn_start.setEnabled(True)
@@ -319,12 +325,19 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
     def _refresh(self):
         if self.state is None:
             return
-        # Timed run: auto-stop when the requested scan time elapses.
-        if (self.threads and getattr(self, "run_deadline", None)
-                and time.time() > self.run_deadline):
-            print("[GUI] scan time reached -> stopping run")
-            self.stop_run()
-            self.lbl_status.setText("stopped (scan time reached)")
+        # Timed run: survey stops on wall time; park stops on LIVE (in-deadband)
+        # time, so a run that drifted out for a while still gets its full
+        # measurement time.
+        if self.threads and getattr(self, "run_seconds", None):
+            if self.run_mode == "park":
+                with self.state.lock:
+                    elapsed = self.state.park_live_s
+            else:
+                elapsed = time.time() - self.run_wall_start
+            if elapsed >= self.run_seconds:
+                print("[GUI] scan time reached -> stopping run")
+                self.stop_run()
+                self.lbl_status.setText("stopped (scan time reached)")
         with self.state.lock:
             tof_edges = self.state.tof_edges.copy()
             tof_hist = self.state.tof_hist.copy()
@@ -341,6 +354,9 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
             gate = self.state.gate
             sweep_dir = self.state.sweep_dir
             t0 = self.state.start_time
+            park_target = self.state.park_target
+            park_active = self.state.park_active
+            park_live = self.state.park_live_s
 
         # ToF display: rebin the fine base histogram so ~100 bins span the
         # current gate (finer gate -> finer ToF display).
@@ -382,6 +398,12 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
         self.lbl_gate.setText(f"gate: {gate[0]*1e6:.2f} -- {gate[1]*1e6:.2f} us")
         self.lbl_dir.setText({1: "sweep dir: up", -1: "sweep dir: down",
                               0: "sweep dir: parked"}.get(sweep_dir, "---"))
+        if park_target is not None:
+            self.lbl_live.setText(
+                f"park live time: {park_live:.1f} s "
+                f"({'IN deadband' if park_active else 'OUT -- not counting'})")
+        else:
+            self.lbl_live.setText("park live time: --- (survey)")
 
     def closeEvent(self, event):
         if self.threads:

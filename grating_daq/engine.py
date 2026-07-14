@@ -164,6 +164,14 @@ class SharedState:
         self.total_events = 0
         self.gated_events = 0
         self.start_time = time.time()
+        # Park-mode live gating: when park_target is set, live counting is
+        # enabled ONLY while |wn - park_target| <= park_deadband, and
+        # park_live_s integrates the seconds actually spent in the deadband
+        # (the lifetime measurement's true measurement time).
+        self.park_target = None
+        self.park_deadband = 0.0
+        self.park_active = False
+        self.park_live_s = 0.0
         self.tof_edges = np.linspace(0.0, self.TOF_MAX, self.N_TOF + 1)
         self.tof_hist = np.zeros(self.N_TOF, dtype=np.int64)
         self.rebin(wn_lo, wn_hi, bin_width)
@@ -237,9 +245,17 @@ class WnPoller(threading.Thread):
             with state.lock:
                 state.wn = wn
                 state.wn_trace.append((now, wn))
+                dt_ok = dt < 5 * self.poll + 1.0
                 i = state.bin_of(wn)
-                if i is not None and dt < 5 * self.poll + 1.0:
+                if i is not None and dt_ok:
                     state.dwell[i] += dt
+                # Park live-time accounting: in the deadband or not?
+                if state.park_target is not None:
+                    state.park_active = (np.isfinite(wn) and
+                                         abs(wn - state.park_target)
+                                         <= state.park_deadband)
+                    if state.park_active and dt_ok:
+                        state.park_live_s += dt
             self.stop_event.wait(self.poll)
 
 
@@ -364,11 +380,16 @@ class ParkController(threading.Thread):
 
     def set_target(self, wn):
         self.target_wn = float(wn)
+        with self.state.lock:
+            self.state.park_target = self.target_wn
 
     def run(self):
         buf = deque(maxlen=int(self.cfg["park_avg_samples"]))
+        with self.state.lock:
+            self.state.park_target = self.target_wn
+            self.state.park_deadband = float(self.cfg["park_deadband"])
         print(f"[Park] holding {self.target_wn:.5f} (deadband "
-              f"+/-{self.cfg['park_deadband']})")
+              f"+/-{self.cfg['park_deadband']}; counting ONLY in-deadband)")
         while not self.stop_event.is_set():
             with self.state.lock:
                 wn = self.state.wn
@@ -448,6 +469,10 @@ class EventCollector(threading.Thread):
                     wn = state.wn
                     sweep_dir = state.sweep_dir
                     g_lo, g_hi = state.gate
+                    # Park mode: LIVE counting only while inside the deadband.
+                    # (Everything is still recorded to events.csv; wn is saved
+                    # per event, so offline cuts can always be re-made.)
+                    counting = (state.park_target is None) or state.park_active
                     for d in data:
                         bunch, channel, tof = d[0], d[2], d[-1]
                         if channel == -1:
@@ -455,6 +480,8 @@ class EventCollector(threading.Thread):
                         if recorder is not None:
                             recorder.add_event(
                                 [now, channel, tof, wn, sweep_dir, bunch])
+                        if not counting:
+                            continue
                         state.total_events += 1
                         ti = np.searchsorted(state.tof_edges, tof) - 1
                         i = state.bin_of(wn)
