@@ -1,8 +1,8 @@
 {
     "scan_settings": {
-        "start_wn": 12625.09,
-        "end_wn": 12625.21,
-        "step_size": 0.001,
+        "start_wn": 12625.18,
+        "end_wn": 12624.18,
+        "step_size": 0.04,
         "stop_mode": "time",
         "stop_val": 2.0,
         "loops": 1,
@@ -46,7 +46,7 @@
     },
     "control_settings": {
         "laser": {
-            "tolerance": 0.0005,
+            "tolerance": 0.02,
             "goto_threshold": 0.01,
             "poll_interval": 0.2,
             "required_stable_samples": 4,
@@ -60,12 +60,14 @@
         "laser_type": "grating",
         "grating": {
             "axis": 1,
-            "tolerance": 0.0001,
-            "step_fine": 0.0001,
-            "step_coarse": 0.001,
-            "poll_interval": 0.01,
-            "required_stable_samples": 4,
-            "wavechannel": 1
+            "tolerance": 0.01,
+            "poll_interval": 0.2,
+            "wavechannel": 3,
+            "wn_per_unit": 11,
+            "backlash": 0.02,
+            "sweep_step": 0.001,
+            "crawl": true,
+            "crawl_leg": 0.05
         }
     },
     "simulation_mode": false

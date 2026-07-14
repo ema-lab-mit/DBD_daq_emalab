@@ -27,6 +27,8 @@ else:
 CONTROLLERNAME = 'HydraPollux'
 COM_PORT = 5
 BAUD_RATE = 19200
+VELOCITY = 0.001  # stage velocity (units/s); set on startup so DAQ sweeps aren't
+                  # slew-limited. Min usable ~0.001; higher overshoots, lower crawls.
 SERVER_IP = '0.0.0.0'
 SERVER_PORT = 8000
 
@@ -62,6 +64,20 @@ class LaserServerInterface:
                 except GCSError as e:
                     print(f"[Server] qIDN threw {e} (tolerated).")
                 self._enable_servo_tolerant()
+                try:
+                    self.pi.VEL(1, VELOCITY)
+                    print(f"[Server] Velocity set (axis 1) = {VELOCITY}")
+                except GCSError as e:
+                    print(f"[Server] VEL set threw {e} (tolerated).")
+                # Soften the start-of-move lurch (the grating overshoots when it
+                # kicks off from rest): set acceleration to a third of stock.
+                # Query current ACC and scale, so we don't guess the unit scale.
+                try:
+                    cur_acc = self.pi.qACC(1)[1]
+                    self.pi.ACC(1, cur_acc / 3.0)
+                    print(f"[Server] Acceleration set (axis 1): {cur_acc} -> {cur_acc / 3.0}")
+                except GCSError as e:
+                    print(f"[Server] ACC set threw {e} (tolerated).")
                 try:
                     print(f"[Server] Position (axis 1): {self.pi.qPOS(1)[1]}")
                 except GCSError as e:
