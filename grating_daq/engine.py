@@ -220,9 +220,15 @@ class WnPoller(threading.Thread):
         self.pv = cfg["wm_pv"]
         self.poll = float(cfg["wn_poll_s"])
         self.stop_event = threading.Event()
+        # Median filter for the park in/out-of-band decision: raw wavemeter
+        # jitter (~+/-0.003) is comparable to the deadband, so single-sample
+        # gating chatters (randomly dropping counts / undercounting live time
+        # while genuinely parked).
+        self._park_buf = deque(maxlen=5)
 
     def set_state(self, state):
         self.state = state
+        self._park_buf.clear()
 
     def read_wn(self):
         try:
@@ -250,11 +256,20 @@ class WnPoller(threading.Thread):
                 i = state.bin_of(wn)
                 if i is not None and dt_ok:
                     state.dwell[i] += dt
-                # Park live-time accounting: in the deadband or not?
+                # Park live-time accounting: in the deadband or not? Decide on
+                # the MEDIAN of the last few readings (jitter immunity) with
+                # hysteresis: enter at the deadband, leave only at 1.5x, so
+                # noise at the edge doesn't chatter the live gate.
                 if state.park_target is not None:
-                    state.park_active = (np.isfinite(wn) and
-                                         abs(wn - state.park_target)
-                                         <= state.park_deadband)
+                    if np.isfinite(wn):
+                        self._park_buf.append(wn)
+                    if self._park_buf:
+                        dev = abs(float(np.median(self._park_buf))
+                                  - state.park_target)
+                        if state.park_active:
+                            state.park_active = dev <= 1.5 * state.park_deadband
+                        else:
+                            state.park_active = dev <= state.park_deadband
                     if state.park_active and dt_ok:
                         state.park_live_s += dt
             self.stop_event.wait(self.poll)
