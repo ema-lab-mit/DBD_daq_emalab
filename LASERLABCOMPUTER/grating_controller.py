@@ -130,6 +130,20 @@ class LaserServerInterface:
             print(f"Hardware Error in MOV: {e}")
             return False
 
+    def VEL(self, axis, velocity):
+        """Set stage velocity (units/s). Lets the DAQ pick a slow scan speed and
+        burst through sticky dead zones without restarting the server."""
+        print(f"[CMD] VEL Axis {axis} -> {velocity}")
+        try:
+            with self.lock:
+                if self.laser:
+                    self.pi.VEL(axis, float(velocity))
+                    time.sleep(0.1)
+            return True
+        except Exception as e:
+            print(f"Hardware Error in VEL: {e}")
+            return False
+
     def qPOS(self, axis):
         try:
             with self.lock:

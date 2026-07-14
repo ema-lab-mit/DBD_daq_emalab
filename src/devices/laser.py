@@ -298,6 +298,18 @@ class GratingDevice(_LaserServerProxy):
     def qPOS(self) -> float:
         return float(self._call("qPOS", self.axis))
 
+    def VEL(self, velocity) -> bool:
+        """Set stage velocity (units/s). Older server builds have no VEL();
+        that comes back as an XML-RPC Fault -> log once and report False so
+        callers can proceed at the server's startup velocity."""
+        try:
+            return bool(self._call("VEL", self.axis, float(velocity)))
+        except xmlrpc.client.Fault:
+            print("[Grating] server has no VEL() method (old build); "
+                  "velocity unchanged -- update the laser-lab server to enable "
+                  "scan-speed control.")
+            return False
+
 
 class ComClient:
     """Thin wrapper around epics.caget so the controller has one indirection

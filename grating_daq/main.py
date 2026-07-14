@@ -33,7 +33,22 @@ from grating_daq.engine import (DEFAULTS, EventCollector, ParkController,
 from src.devices.laser import GratingDevice
 from src.devices.tagger import Tagger
 
-pg.setConfigOptions(antialias=False, background="k", foreground="w")
+# Matplotlib-like styling (white canvas, dark axes, grids) while keeping
+# pyqtgraph's fast redraws -- real matplotlib can't keep up with 0.5 s updates.
+pg.setConfigOptions(antialias=True, background="w", foreground="k")
+
+MPL_BLUE = (31, 119, 180)
+MPL_ORANGE = (255, 127, 14)
+MPL_GREEN = (44, 160, 44)
+MPL_RED = (214, 39, 40)
+
+
+def _style(plot, title):
+    plot.setTitle(title, color="k", size="11pt")
+    plot.showGrid(x=True, y=True, alpha=0.25)
+    for ax in ("bottom", "left"):
+        plot.getAxis(ax).setPen(pg.mkPen("k"))
+        plot.getAxis(ax).setTextPen(pg.mkPen("k"))
 
 
 class GratingDAQWindow(QtWidgets.QMainWindow):
@@ -86,12 +101,17 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
         self.in_wn_lo = dspin(10000, 20000, 12624.8)
         self.in_wn_hi = dspin(10000, 20000, 12625.6)
         self.in_bin = dspin(0.001, 1.0, 0.01, dec=4, step=0.005)
+        self.in_minutes = dspin(0, 24 * 60, 0, dec=1, step=5)
+        self.in_scan_vel = dspin(0.0001, 0.01, self.cfg["scan_velocity"],
+                                 dec=5, step=0.0001)
         self.in_park = dspin(10000, 20000, 12625.20)
         self.in_deadband = dspin(0.001, 1.0, self.cfg["park_deadband"],
                                  dec=4, step=0.005)
         form.addRow("Survey wn low", self.in_wn_lo)
         form.addRow("Survey wn high", self.in_wn_hi)
         form.addRow("Spectrum bin (cm^-1)", self.in_bin)
+        form.addRow("Scan time (min, 0=inf)", self.in_minutes)
+        form.addRow("Scan velocity (units/s)", self.in_scan_vel)
         form.addRow("Park target wn", self.in_park)
         form.addRow("Park deadband (cm^-1)", self.in_deadband)
 
@@ -138,30 +158,40 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
         grid = pg.GraphicsLayoutWidget()
         root.addWidget(grid, 1)
 
-        self.p_tof = grid.addPlot(title="ToF spectrum (all events) + gate")
+        self.p_tof = grid.addPlot()
+        _style(self.p_tof, "ToF spectrum (all events) + gate")
         self.p_tof.setLabel("bottom", "ToF", units="s")
-        self.tof_curve = self.p_tof.plot(stepMode="center",
-                                         fillLevel=0, brush=(80, 80, 200, 120))
-        self.gate_region = pg.LinearRegionItem(values=(2e-6, 8e-6))
+        self.p_tof.setLabel("left", "counts")
+        self.tof_curve = self.p_tof.plot(
+            stepMode="center", pen=pg.mkPen(MPL_BLUE, width=1.2),
+            fillLevel=0, brush=MPL_BLUE + (60,))
+        self.gate_region = pg.LinearRegionItem(
+            values=(2e-6, 8e-6), brush=(214, 39, 40, 25),
+            pen=pg.mkPen(MPL_RED, width=1.5))
         self.p_tof.addItem(self.gate_region)
         self.gate_region.sigRegionChanged.connect(self._gate_moved)
 
-        self.p_spec = grid.addPlot(
-            title="Wn spectrum: gated counts / dwell time")
-        self.p_spec.setLabel("bottom", "wavenumber", units="cm-1")
+        self.p_spec = grid.addPlot()
+        _style(self.p_spec, "Wn spectrum: gated counts / dwell time")
+        self.p_spec.setLabel("bottom", "wavenumber (cm^-1)")
         self.p_spec.setLabel("left", "rate", units="Hz")
-        self.spec_curve = self.p_spec.plot(stepMode="center",
-                                           fillLevel=0, brush=(80, 200, 80, 120))
+        # Line + points on bin centers (matplotlib errorbar-plot style).
+        self.spec_curve = self.p_spec.plot(
+            pen=pg.mkPen(MPL_GREEN, width=1.2), symbol="o", symbolSize=5,
+            symbolPen=pg.mkPen(MPL_GREEN), symbolBrush=MPL_GREEN)
 
         grid.nextRow()
-        self.p_wn = grid.addPlot(title="wavenumber vs time")
+        self.p_wn = grid.addPlot()
+        _style(self.p_wn, "wavenumber vs time")
         self.p_wn.setLabel("bottom", "t", units="s")
-        self.wn_curve = self.p_wn.plot(pen=pg.mkPen("y", width=1))
+        self.p_wn.setLabel("left", "wn (cm^-1)")
+        self.wn_curve = self.p_wn.plot(pen=pg.mkPen(MPL_ORANGE, width=1.3))
 
-        self.p_rate = grid.addPlot(title="gated rate vs time (lifetime view)")
+        self.p_rate = grid.addPlot()
+        _style(self.p_rate, "gated rate vs time (lifetime view)")
         self.p_rate.setLabel("bottom", "t", units="s")
         self.p_rate.setLabel("left", "rate", units="Hz")
-        self.rate_curve = self.p_rate.plot(pen=pg.mkPen("c", width=1))
+        self.rate_curve = self.p_rate.plot(pen=pg.mkPen(MPL_BLUE, width=1.3))
 
     # ----------------------------------------------------------- run control
     def start_run(self):
@@ -175,9 +205,13 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
             return
 
         self.cfg["park_deadband"] = self.in_deadband.value()
+        self.cfg["scan_velocity"] = self.in_scan_vel.value()
+        minutes = self.in_minutes.value()
+        self.run_deadline = (time.time() + minutes * 60.0) if minutes > 0 else None
         params = dict(self.cfg)
         params.update({"mode": mode, "wn_lo": wn_lo, "wn_hi": wn_hi,
                        "bin_width": self.in_bin.value(),
+                       "scan_minutes": minutes,
                        "park_target": self.in_park.value()})
 
         try:
@@ -261,10 +295,16 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
     def _refresh(self):
         if self.state is None:
             return
+        # Timed run: auto-stop when the requested scan time elapses.
+        if (self.threads and getattr(self, "run_deadline", None)
+                and time.time() > self.run_deadline):
+            print("[GUI] scan time reached -> stopping run")
+            self.stop_run()
+            self.lbl_status.setText("stopped (scan time reached)")
         with self.state.lock:
             tof_edges = self.state.tof_edges.copy()
             tof_hist = self.state.tof_hist.copy()
-            wn_edges = self.state.wn_edges.copy()
+            wn_centers = self.state.wn_centers.copy()
             dwell = self.state.dwell.copy()
             gated = self.state.gated_counts.copy()
             wn_trace = list(self.state.wn_trace)
@@ -279,7 +319,10 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
         self.tof_curve.setData(tof_edges, tof_hist)
         with np.errstate(divide="ignore", invalid="ignore"):
             rate = np.where(dwell > 0, gated / np.maximum(dwell, 1e-9), 0.0)
-        self.spec_curve.setData(wn_edges, rate)
+        # Only draw bins the laser has actually visited (dwell > 0) so the
+        # line/point spectrum isn't dragged to zero by untouched bins.
+        vis = dwell > 0
+        self.spec_curve.setData(wn_centers[vis], rate[vis])
 
         if wn_trace:
             ts, ws = zip(*wn_trace)

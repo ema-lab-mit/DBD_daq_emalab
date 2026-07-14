@@ -58,6 +58,13 @@ DEFAULTS = {
     "survey_leg": 0.05,                  # glide leg length (stage units)
     "reverse_leg_scale": 0.2,            # conservative leg against preferred dir
     "wn_poll_s": 0.1,                    # wavemeter poll (dwell integration step)
+    # Adaptive sweep speed (needs the server's VEL() method):
+    #   scan_velocity  : slow glide where the laser responds (dense sampling)
+    #   burst_velocity : temporary speed to punch through sticky dead zones
+    #   stall_burst_s  : wn flat for this long while gliding -> burst
+    "scan_velocity": 0.0005,
+    "burst_velocity": 0.004,
+    "stall_burst_s": 6.0,
     "park_deadband": 0.01,               # cm^-1: do nothing inside this
     "park_nudge_gain": 0.5,              # fraction of predicted correction
     "park_nudge_max": 0.003,             # stage units per nudge, hard cap
@@ -239,7 +246,24 @@ class SurveySweeper(threading.Thread):
     def run(self):
         wn_dir = int(self.cfg["preferred_wn_dir"])  # start in the smooth direction
         leg_target = None
-        print(f"[Survey] sweeping {self.wn_lo:.4f} <-> {self.wn_hi:.4f}")
+        # Anti-dead-time: the drive has spots where the optic sticks while the
+        # motor winds through (wn plateaus = wasted scan time). Glide slowly for
+        # dense sampling where the laser responds; when wn has been flat for
+        # stall_burst_s, temporarily raise the velocity to punch through, then
+        # drop back the moment wn moves again.
+        scan_v = float(self.cfg["scan_velocity"])
+        burst_v = float(self.cfg["burst_velocity"])
+        stall_s = float(self.cfg["stall_burst_s"])
+        vel_ok = False
+        try:
+            vel_ok = self.laser.VEL(scan_v)
+        except Exception as e:
+            print(f"[Survey] VEL failed: {e}")
+        bursting = False
+        ref_wn = None
+        ref_time = time.time()
+        print(f"[Survey] sweeping {self.wn_lo:.4f} <-> {self.wn_hi:.4f} "
+              f"(scan_v={scan_v}, burst={'on' if vel_ok else 'UNAVAILABLE'})")
         while not self.stop_event.is_set():
             with self.state.lock:
                 wn = self.state.wn
@@ -253,6 +277,26 @@ class SurveySweeper(threading.Thread):
                     wn_dir = +1
                     leg_target = None
                     print(f"[Survey] bottom limit ({wn:.4f}) -> reversing up")
+                # Stall/burst bookkeeping (only when VEL is available).
+                now = time.time()
+                if ref_wn is None or abs(wn - ref_wn) > 0.01:
+                    ref_wn = wn
+                    ref_time = now
+                    if bursting:
+                        bursting = False
+                        try:
+                            self.laser.VEL(scan_v)
+                            print(f"[Survey] wn moving again -> scan speed {scan_v}")
+                        except Exception as e:
+                            print(f"[Survey] VEL restore failed: {e}")
+                elif vel_ok and not bursting and (now - ref_time) > stall_s:
+                    bursting = True
+                    try:
+                        self.laser.VEL(burst_v)
+                        print(f"[Survey] wn stalled {stall_s:.0f}s at {wn:.4f} "
+                              f"-> burst speed {burst_v}")
+                    except Exception as e:
+                        print(f"[Survey] VEL burst failed: {e}")
             try:
                 pos = self.laser.qPOS()
                 sd = self._stage_dir(wn_dir)
@@ -264,9 +308,11 @@ class SurveySweeper(threading.Thread):
             except Exception as e:
                 print(f"[Survey] laser I/O error: {e}")
             self.stop_event.wait(1.0)
-        # Halt in place on stop.
+        # Halt in place on stop; restore the server's default speed.
         try:
             self.laser.MOV(self.laser.qPOS())
+            if vel_ok:
+                self.laser.VEL(float(self.cfg["stage_velocity"]))
         except Exception:
             pass
         print("[Survey] sweeper stopped")
