@@ -66,9 +66,10 @@ DEFAULTS = {
     "burst_velocity": 0.004,
     "stall_burst_s": 6.0,
     "park_deadband": 0.01,               # cm^-1: do nothing inside this
-    "park_nudge_gain": 0.5,              # fraction of predicted correction
-    "park_nudge_max": 0.003,             # stage units per nudge, hard cap
-    "park_nudge_min_interval": 3.0,      # s between nudges
+    "park_settle_wait": 12.0,            # s CONTINUOUSLY outside before a poke
+    "park_nudge_min_interval": 12.0,     # s between pokes
+    "park_poke": 0.0005,                 # stage units: fixed tiny poke size
+    "park_poke_max": 0.002,              # escalation cap if persistently out
     "park_avg_samples": 5,               # wn averaging for the park loop
 }
 
@@ -361,11 +362,21 @@ class SurveySweeper(threading.Thread):
 
 
 class ParkController(threading.Thread):
-    """Hold the laser at target_wn: deadband + slow proportional nudges.
-    Inside the deadband nothing is commanded at all. Outside it, one small
-    nudge toward the target (conservative against the preferred direction),
-    then a mandatory quiet period. This deliberately under-controls: with
-    bimodal stiction, the less you poke the drive, the stiller it sits."""
+    """Hold the laser at target_wn: nudge INTO the deadband, then FREEZE.
+
+    Every commanded move risks a stick-slip lurch far bigger than the
+    deadband, so an eager controller ping-pongs the laser across resonance
+    (each correction overshoots, triggering the next). Patience over action:
+
+      * inside the deadband -> command NOTHING, ever;
+      * drifts out -> WAIT (park_settle_wait of CONTINUOUS out-time) -- it
+        usually wanders back on its own;
+      * still out -> one tiny FIXED poke toward the target (park_poke, not
+        error-proportional: a small poke either does nothing, which is safe,
+        or gently releases; a big one lurches), halved against the smooth
+        direction, then another long quiet period;
+      * persistently out -> escalate the poke slowly (x1.5, capped); any
+        re-entry into the deadband resets it to minimum."""
 
     def __init__(self, laser: GratingDevice, state: SharedState, cfg: dict,
                  target_wn: float):
@@ -385,11 +396,18 @@ class ParkController(threading.Thread):
 
     def run(self):
         buf = deque(maxlen=int(self.cfg["park_avg_samples"]))
+        deadband = float(self.cfg["park_deadband"])
+        settle = float(self.cfg["park_settle_wait"])
+        interval = float(self.cfg["park_nudge_min_interval"])
+        poke_min = float(self.cfg["park_poke"])
+        poke_max = float(self.cfg["park_poke_max"])
+        poke = poke_min
+        out_since = None            # wall time the laser left the deadband
         with self.state.lock:
             self.state.park_target = self.target_wn
-            self.state.park_deadband = float(self.cfg["park_deadband"])
-        print(f"[Park] holding {self.target_wn:.5f} (deadband "
-              f"+/-{self.cfg['park_deadband']}; counting ONLY in-deadband)")
+            self.state.park_deadband = deadband
+        print(f"[Park] holding {self.target_wn:.5f} (deadband +/-{deadband}; "
+              f"freeze-in-band, poke only after {settle:.0f}s out)")
         while not self.stop_event.is_set():
             with self.state.lock:
                 wn = self.state.wn
@@ -400,26 +418,37 @@ class ParkController(threading.Thread):
                 avg = sum(buf) / len(buf)
                 err = self.target_wn - avg
                 now = time.time()
-                if (abs(err) > float(self.cfg["park_deadband"])
-                        and now - self.last_nudge
-                        > float(self.cfg["park_nudge_min_interval"])):
-                    step = (float(self.cfg["park_nudge_gain"]) * err
-                            / self.cfg["wn_per_unit"])
-                    cap = float(self.cfg["park_nudge_max"])
-                    step = max(-cap, min(cap, step))
-                    wn_dir = 1 if err > 0 else -1
-                    if wn_dir != int(self.cfg["preferred_wn_dir"]):
-                        step *= 0.5  # extra conservative on the lurchy side
-                    try:
-                        pos = self.laser.qPOS()
-                        self.laser.MOV(pos + step)
-                        self.last_nudge = now
-                        self.n_nudges += 1
-                        buf.clear()
-                        print(f"[Park] nudge #{self.n_nudges}: wn={avg:.5f} "
-                              f"err={err:+.4f} step={step:+.5f}")
-                    except Exception as e:
-                        print(f"[Park] laser I/O error: {e}")
+                if abs(err) <= deadband:
+                    # In the band: freeze. Reset all escalation/waiting.
+                    if out_since is not None:
+                        print(f"[Park] back in the deadband (wn={avg:.5f}) -> frozen")
+                    out_since = None
+                    poke = poke_min
+                else:
+                    if out_since is None:
+                        out_since = now
+                    # Poke only after a long CONTINUOUS excursion + quiet period.
+                    if (now - out_since > settle
+                            and now - self.last_nudge > interval):
+                        # Fixed tiny poke; wn direction -> stage direction via
+                        # the slope sign.
+                        wn_dir = 1 if err > 0 else -1
+                        step = wn_dir * poke * \
+                            (1.0 if self.cfg["wn_per_unit"] >= 0 else -1.0)
+                        if wn_dir != int(self.cfg["preferred_wn_dir"]):
+                            step *= 0.5  # extra conservative on the lurchy side
+                        try:
+                            pos = self.laser.qPOS()
+                            self.laser.MOV(pos + step)
+                            self.last_nudge = now
+                            self.n_nudges += 1
+                            buf.clear()
+                            print(f"[Park] poke #{self.n_nudges}: wn={avg:.5f} "
+                                  f"err={err:+.4f} step={step:+.5f} "
+                                  f"(out {now - out_since:.0f}s)")
+                            poke = min(poke * 1.5, poke_max)  # slow escalation
+                        except Exception as e:
+                            print(f"[Park] laser I/O error: {e}")
             self.stop_event.wait(0.3)
         print("[Park] controller stopped")
 
