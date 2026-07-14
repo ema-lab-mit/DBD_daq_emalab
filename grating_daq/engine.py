@@ -149,19 +149,24 @@ class RunRecorder:
 class SharedState:
     """Thread-shared live values + histograms, all under one lock."""
 
+    # Fine ToF base resolution: 2000 bins over 20 us (10 ns). The DISPLAY
+    # rebins from this base (gate_width/100 per shown bin) and the wn spectrum
+    # is re-derived from the 2D histogram under the CURRENT gate -- so moving
+    # the gate re-gates ALL data collected so far, not just future events.
+    N_TOF = 2000
+    TOF_MAX = 20e-6
+
     def __init__(self, wn_lo, wn_hi, bin_width):
         self.lock = threading.Lock()
         self.wn = float("nan")            # latest wavemeter reading
         self.sweep_dir = 0                # -1/0/+1, published by the laser thread
-        self.gate = (0.0, 20e-6)          # ToF gate (s); selects LIVE displays
+        self.gate = (0.0, self.TOF_MAX)   # ToF gate (s); selects LIVE displays
         self.total_events = 0
         self.gated_events = 0
         self.start_time = time.time()
-        # wn histograms
+        self.tof_edges = np.linspace(0.0, self.TOF_MAX, self.N_TOF + 1)
+        self.tof_hist = np.zeros(self.N_TOF, dtype=np.int64)
         self.rebin(wn_lo, wn_hi, bin_width)
-        # ToF histogram (fixed 20 us window, 400 bins)
-        self.tof_edges = np.linspace(0, 20e-6, 401)
-        self.tof_hist = np.zeros(400, dtype=np.int64)
         # strip-chart deques: (t, value)
         self.wn_trace = deque(maxlen=3000)
         self.rate_trace = deque(maxlen=3000)
@@ -172,7 +177,16 @@ class SharedState:
         self.wn_centers = 0.5 * (self.wn_edges[:-1] + self.wn_edges[1:])
         self.dwell = np.zeros(n)          # seconds the laser spent in each bin
         self.counts = np.zeros(n, dtype=np.int64)         # all events
-        self.gated_counts = np.zeros(n, dtype=np.int64)   # events inside gate
+        # 2D histogram (wn bin x fine ToF bin): the gated spectrum is derived
+        # from this under whatever gate is set at display time.
+        self.hist2d = np.zeros((n, self.N_TOF), dtype=np.int32)
+
+    def gated_spectrum(self):
+        """Gated counts per wn bin under the CURRENT gate, from all data."""
+        i0 = int(np.searchsorted(self.tof_edges, self.gate[0]) - 1)
+        i1 = int(np.searchsorted(self.tof_edges, self.gate[1]))
+        i0 = max(0, i0)
+        return self.hist2d[:, i0:i1].sum(axis=1)
 
     def bin_of(self, wn):
         if not np.isfinite(wn):
@@ -185,14 +199,21 @@ class SharedState:
 
 class WnPoller(threading.Thread):
     """Reads the wavemeter continuously; publishes state.wn, integrates dwell
-    time into the current wn bin, and feeds the wn strip chart."""
+    time into the current wn bin, and feeds the wn strip chart.
 
-    def __init__(self, state: SharedState, cfg: dict):
+    PERSISTENT: created once per app and rebound to each run's SharedState via
+    set_state(). pyepics CA contexts do not survive thread churn -- spawning a
+    fresh caget thread per run made the wn trace die on the second run."""
+
+    def __init__(self, cfg: dict):
         super().__init__(daemon=True)
-        self.state = state
+        self.state = None
         self.pv = cfg["wm_pv"]
         self.poll = float(cfg["wn_poll_s"])
         self.stop_event = threading.Event()
+
+    def set_state(self, state):
+        self.state = state
 
     def read_wn(self):
         try:
@@ -204,16 +225,21 @@ class WnPoller(threading.Thread):
     def run(self):
         last = time.time()
         while not self.stop_event.is_set():
+            state = self.state
+            if state is None:
+                last = time.time()
+                self.stop_event.wait(self.poll)
+                continue
             wn = self.read_wn()
             now = time.time()
             dt = now - last
             last = now
-            with self.state.lock:
-                self.state.wn = wn
-                self.state.wn_trace.append((now, wn))
-                i = self.state.bin_of(wn)
+            with state.lock:
+                state.wn = wn
+                state.wn_trace.append((now, wn))
+                i = state.bin_of(wn)
                 if i is not None and dt < 5 * self.poll + 1.0:
-                    self.state.dwell[i] += dt
+                    state.dwell[i] += dt
             self.stop_event.wait(self.poll)
 
 
@@ -379,19 +405,38 @@ class ParkController(threading.Thread):
 
 class EventCollector(threading.Thread):
     """Drains the tagger, stamps each event with the current wn and sweep
-    direction, records EVERYTHING, and feeds the live histograms (spectrum
-    counts use the ToF gate; the saved data is ungated)."""
+    direction, records EVERYTHING, and fills the base histograms (ToF + the
+    wn x ToF 2D histogram; the display derives the gated spectrum from the 2D
+    histogram under the CURRENT gate, so gate moves re-gate all data).
 
-    def __init__(self, tagger: Tagger, state: SharedState, recorder: RunRecorder):
+    PERSISTENT: created once per app; rebind(state, recorder) per run,
+    rebind(None, None) between runs."""
+
+    def __init__(self, tagger: Tagger):
         super().__init__(daemon=True)
         self.tagger = tagger
+        self.state = None
+        self.recorder = None
+        self.stop_event = threading.Event()
+        self._rate_window = deque(maxlen=4000)  # gated event wall-times
+
+    def rebind(self, state, recorder):
         self.state = state
         self.recorder = recorder
-        self.stop_event = threading.Event()
-        self._rate_window = deque(maxlen=2000)  # gated event wall-times
+        self._rate_window.clear()
 
     def run(self):
         while not self.stop_event.is_set():
+            state, recorder = self.state, self.recorder
+            if state is None:
+                # No active run: keep draining the tagger so its buffer never
+                # backs up, but discard the packets.
+                try:
+                    self.tagger.get_data()
+                except Exception:
+                    pass
+                self.stop_event.wait(0.2)
+                continue
             try:
                 data = self.tagger.get_data()
             except Exception as e:
@@ -399,34 +444,35 @@ class EventCollector(threading.Thread):
                 data = []
             now = time.time()
             if data:
-                with self.state.lock:
-                    wn = self.state.wn
-                    sweep_dir = self.state.sweep_dir
-                    g_lo, g_hi = self.state.gate
+                with state.lock:
+                    wn = state.wn
+                    sweep_dir = state.sweep_dir
+                    g_lo, g_hi = state.gate
                     for d in data:
                         bunch, channel, tof = d[0], d[2], d[-1]
                         if channel == -1:
                             continue  # trigger marker, not an event
-                        self.recorder.add_event(
-                            [now, channel, tof, wn, sweep_dir, bunch])
-                        self.state.total_events += 1
-                        ti = np.searchsorted(self.state.tof_edges, tof) - 1
-                        if 0 <= ti < len(self.state.tof_hist):
-                            self.state.tof_hist[ti] += 1
-                        i = self.state.bin_of(wn)
-                        if i is not None:
-                            self.state.counts[i] += 1
-                        if g_lo <= tof <= g_hi:
-                            self.state.gated_events += 1
-                            self._rate_window.append(now)
+                        if recorder is not None:
+                            recorder.add_event(
+                                [now, channel, tof, wn, sweep_dir, bunch])
+                        state.total_events += 1
+                        ti = np.searchsorted(state.tof_edges, tof) - 1
+                        i = state.bin_of(wn)
+                        if 0 <= ti < len(state.tof_hist):
+                            state.tof_hist[ti] += 1
                             if i is not None:
-                                self.state.gated_counts[i] += 1
+                                state.hist2d[i, ti] += 1
+                        if i is not None:
+                            state.counts[i] += 1
+                        if g_lo <= tof <= g_hi:
+                            state.gated_events += 1
+                            self._rate_window.append(now)
             # gated rate over the last 5 s
             cutoff = now - 5.0
             while self._rate_window and self._rate_window[0] < cutoff:
                 self._rate_window.popleft()
-            with self.state.lock:
-                self.state.rate_trace.append((now, len(self._rate_window) / 5.0))
+            with state.lock:
+                state.rate_trace.append((now, len(self._rate_window) / 5.0))
             self.stop_event.wait(0.05)
 
 

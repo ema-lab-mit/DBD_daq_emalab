@@ -62,8 +62,13 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
         self.tagger = None
         self.state = None
         self.recorder = None
-        self.threads = []
+        self.threads = []      # per-run laser threads (sweeper / park)
         self.park = None
+        # Persistent workers (pyepics CA contexts don't survive thread churn;
+        # one poller/collector for the app's lifetime, rebound per run).
+        self.wn_poller = None
+        self.collector = None
+        self.wn0 = None        # center wn for the relative-frequency axis
 
         self._build_ui()
 
@@ -114,6 +119,10 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
         form.addRow("Scan velocity (units/s)", self.in_scan_vel)
         form.addRow("Park target wn", self.in_park)
         form.addRow("Park deadband (cm^-1)", self.in_deadband)
+
+        self.chk_freq = QtWidgets.QCheckBox(
+            "Spectrum x-axis: relative frequency (GHz, v0 = range center)")
+        panel.addWidget(self.chk_freq)
 
         self.btn_start = QtWidgets.QPushButton("START")
         self.btn_stop = QtWidgets.QPushButton("STOP")
@@ -226,12 +235,22 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
             return
 
         self.state = SharedState(wn_lo, wn_hi, self.in_bin.value())
+        self.wn0 = 0.5 * (wn_lo + wn_hi)
         g = self.gate_region.getRegion()
         self.state.gate = (min(g), max(g))
         self.recorder = RunRecorder(mode, params)
 
-        self.threads = [WnPoller(self.state, self.cfg),
-                        EventCollector(self.tagger, self.state, self.recorder)]
+        # Persistent workers: start once, rebind to this run.
+        if self.wn_poller is None:
+            self.wn_poller = WnPoller(self.cfg)
+            self.wn_poller.start()
+        if self.collector is None:
+            self.collector = EventCollector(self.tagger)
+            self.collector.start()
+        self.wn_poller.set_state(self.state)
+        self.collector.rebind(self.state, self.recorder)
+
+        self.threads = []
         if mode == "survey":
             self.threads.append(
                 SurveySweeper(self.laser, self.state, self.cfg, wn_lo, wn_hi))
@@ -251,6 +270,11 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
         self.btn_nri.setEnabled(True)
 
     def stop_run(self):
+        # Unbind the persistent workers first so nothing writes mid-teardown.
+        if self.collector is not None:
+            self.collector.rebind(None, None)
+        if self.wn_poller is not None:
+            self.wn_poller.set_state(None)
         for t in self.threads:
             t.stop_event.set()
         for t in self.threads:
@@ -260,7 +284,7 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
             with self.state.lock:
                 self.recorder.save_spectrum(
                     self.state.wn_centers, self.state.dwell,
-                    self.state.counts, self.state.gated_counts)
+                    self.state.counts, self.state.gated_spectrum())
                 extra = {"stopped": time.strftime("%Y%m%d_%H%M%S"),
                          "total_events": int(self.state.total_events),
                          "gated_events": int(self.state.gated_events),
@@ -306,7 +330,9 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
             tof_hist = self.state.tof_hist.copy()
             wn_centers = self.state.wn_centers.copy()
             dwell = self.state.dwell.copy()
-            gated = self.state.gated_counts.copy()
+            # Re-derived from the 2D histogram under the CURRENT gate: moving
+            # the gate re-gates everything collected so far.
+            gated = self.state.gated_spectrum()
             wn_trace = list(self.state.wn_trace)
             rate_trace = list(self.state.rate_trace)
             wn = self.state.wn
@@ -316,13 +342,28 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
             sweep_dir = self.state.sweep_dir
             t0 = self.state.start_time
 
-        self.tof_curve.setData(tof_edges, tof_hist)
+        # ToF display: rebin the fine base histogram so ~100 bins span the
+        # current gate (finer gate -> finer ToF display).
+        base_bw = tof_edges[1] - tof_edges[0]
+        factor = int(max(1, round(((gate[1] - gate[0]) / 100.0) / base_bw)))
+        nb = len(tof_hist) // factor
+        disp_hist = tof_hist[:nb * factor].reshape(nb, factor).sum(axis=1)
+        disp_edges = tof_edges[::factor][:nb + 1]
+        self.tof_curve.setData(disp_edges, disp_hist)
+
         with np.errstate(divide="ignore", invalid="ignore"):
             rate = np.where(dwell > 0, gated / np.maximum(dwell, 1e-9), 0.0)
         # Only draw bins the laser has actually visited (dwell > 0) so the
         # line/point spectrum isn't dragged to zero by untouched bins.
         vis = dwell > 0
-        self.spec_curve.setData(wn_centers[vis], rate[vis])
+        if self.chk_freq.isChecked() and self.wn0 is not None:
+            xs = (wn_centers - self.wn0) * 29.9792458  # cm^-1 -> GHz
+            self.p_spec.setLabel(
+                "bottom", f"rel. frequency (GHz, v0 = {self.wn0:.4f} cm^-1)")
+        else:
+            xs = wn_centers
+            self.p_spec.setLabel("bottom", "wavenumber (cm^-1)")
+        self.spec_curve.setData(xs[vis], rate[vis])
 
         if wn_trace:
             ts, ws = zip(*wn_trace)
@@ -345,6 +386,9 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         if self.threads:
             self.stop_run()
+        for worker in (self.wn_poller, self.collector):
+            if worker is not None:
+                worker.stop_event.set()
         if self.tagger is not None:
             try:
                 self.tagger.stop()
