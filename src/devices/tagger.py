@@ -41,8 +41,11 @@ def compute_tof_from_data(data: pd.DataFrame):
             tofs.append(flops_to_time(tof))
     return np.array(tofs)
 
-INIT_TIME = 1e-6
-STOP_TIME_WINDOW = 10e-6
+# Card window after each trigger (hits outside it are never recorded). 2026-10-01: 0-20 us, the full
+# grating-DAQ ToF plot (engine TOF_MAX), so the Cs+ bunch at ~17 us shows; was 4-6 us (local edit for
+# the sulfur runs) and 1-10 us in git. The card cannot go past 2^24 x 100 ps = 1677.7 us.
+INIT_TIME = 0.0
+STOP_TIME_WINDOW = 20e-6
 
 class Tagger:
     """
