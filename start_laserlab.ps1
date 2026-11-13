@@ -3,7 +3,7 @@
 
   Brings up the two background servers the DAQ depends on:
     1. laser_server.py    XML-RPC :8000  ->  Matisse Commander :30000
-    2. wavemeter_test.py  pcaspy IOC     ->  LaserLab:wavenumber_1..4 (HighFinesse)
+    2. wavemeter_testing.py  pcaspy IOC     ->  LaserLab:wavenumber_1..4 (HighFinesse)
 
   Each launches in its OWN window and must stay open for the whole run.
 
@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 
 # --- EDIT IF PATHS DIFFER ON THIS MACHINE ---------------------------------
 $LaserServer  = 'C:\Users\admin\Documents\ControllerC663_testing\laser_server.py'
-$WavemeterIoc = 'C:\Users\admin\Documents\TW_DAQ\src\tests\wavemeter_test.py'  # <-- set to the real path
+$WavemeterIoc = 'C:\Users\admin\Documents\Wavemeter\wavemeter_testing.py'
 # --------------------------------------------------------------------------
 
 if (-not (Test-Path $LaserServer))  { Write-Host "MISSING: $LaserServer"  -ForegroundColor Red; return }
@@ -46,7 +46,7 @@ Write-Host ''
 if (-not $up) { Write-Host '   WARNING: port 8000 never came up -- check the laser_server window.' -ForegroundColor Yellow }
 
 # 2. Wavemeter EPICS IOC ---------------------------------------------------
-Write-Host '== Starting wavemeter_test.py (EPICS IOC) ==' -ForegroundColor Cyan
+Write-Host '== Starting wavemeter_testing.py (EPICS IOC) ==' -ForegroundColor Cyan
 $iocDir = Split-Path $WavemeterIoc
 Start-Process powershell -ArgumentList @(
   '-NoExit','-Command',

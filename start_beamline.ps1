@@ -27,7 +27,7 @@ $wn = python -c "import epics; print(epics.caget('LaserLab:wavenumber_1'))"
 Write-Host "   LaserLab:wavenumber_1 = $wn"
 if (-not $wn -or $wn -eq 'None' -or $wn -match '^0\.0+$') {
   Write-Host '   ERROR: wavenumber reads 0.0/None -- wavemeter IOC not serving. Data would log 0.0 SILENTLY.' -ForegroundColor Red
-  Write-Host '   Fix the laser-lab side (HighFinesse WLM + wavemeter_test.py) before scanning. Aborting.' -ForegroundColor Red
+  Write-Host '   Fix the laser-lab side (HighFinesse WLM + wavemeter_testing.py) before scanning. Aborting.' -ForegroundColor Red
   return
 }
 

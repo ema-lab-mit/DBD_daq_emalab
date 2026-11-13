@@ -5,7 +5,7 @@ How to bring up a **real** (non-simulated) laser scan end to end. The setup span
 
 | Role | Machine | User | Runs |
 |---|---|---|---|
-| Laser lab | `10.54.6.1` | `admin` | Matisse Commander, `laser_server.py`, wavemeter IOC (`wavemeter_test.py`) |
+| Laser lab | `10.54.6.1` | `admin` | Matisse Commander, `laser_server.py`, wavemeter IOC (`Documents\Wavemeter\wavemeter_testing.py`) |
 | Beamline / DAQ | `10.54.5.139` | `EMALAB` | `main.py` (this repo) |
 
 The HighFinesse wavemeter is physically connected to the **laser-lab** machine, so
@@ -42,7 +42,7 @@ those are manual steps below.
   `python C:\Users\admin\Documents\ControllerC663_testing\laser_server.py`
   — wait for `RUNNING ON PORT 8000`.
 - On the **laser-lab computer**, start the **wavemeter EPICS IOC**:
-  `python ...\wavemeter_test.py` — wait for `started`. Requires the HighFinesse WLM
+  `python C:\Users\admin\Documents\Wavemeter\wavemeter_testing.py` — wait for `started`. Requires the HighFinesse WLM
   software running. *(Without it, every `wavemeter_wn` logs 0.0 silently.)*
 - On the **beamline computer**, set `$env:EPICS_CA_ADDR_LIST="10.54.6.1"`, then open the
   **DAQ**. *(Or just run `start_beamline.ps1`.)*

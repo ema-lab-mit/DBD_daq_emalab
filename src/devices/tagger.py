@@ -44,8 +44,11 @@ def compute_tof_from_data(data: pd.DataFrame):
 # Card window after each trigger (hits outside it are never recorded). 2026-10-01: 0-20 us, the full
 # grating-DAQ ToF plot (engine TOF_MAX), so the Cs+ bunch at ~17 us shows; was 4-6 us (local edit for
 # the sulfur runs) and 1-10 us in git. The card cannot go past 2^24 x 100 ps = 1677.7 us.
+# Do NOT narrow this to an isotope gate: all-mass hits per bunch are the total-beam-rate (RFQ load)
+# monitor for the line-motion correction; gate in the analysis instead.
 INIT_TIME = 0.0
-STOP_TIME_WINDOW = 20e-6
+STOP_TIME_WINDOW = 1600e-6   # 2026-10-30: was 20 us; save the full window (all masses, slow
+                             # species, SUGUI's 1000-1600 us background) - card max ~1677 us
 
 class Tagger:
     """
