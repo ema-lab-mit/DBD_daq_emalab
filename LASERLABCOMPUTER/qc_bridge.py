@@ -9,7 +9,7 @@ what the QC itself answers on its serial port ('ok' to settings, the value to qu
 Safety:
   * only clients in --allow may connect (default: the beamline PC + this PC);
   * queries are allowed for every channel, but SETTINGS only for the channels in
-    --write (default: 1 = channel A). T0 / system commands (:PULSE0:..., :INST:STATE)
+    --write (default: 1,5 = channel A inter-laser delay, E NRI Merion). T0 / system commands (:PULSE0:..., :INST:STATE)
     are always refused, so nothing remote can stop this lab's QC outputs;
   * every accepted setting is logged to qc_bridge_log.csv next to this file.
 
@@ -19,7 +19,7 @@ bridge, Ctrl+C, before using QC_GUI.py again).
 usage (on the laser-lab PC):
     python qc_bridge.py --com COM3                 # real QC on COM3
     python qc_bridge.py --sim                      # no hardware (test)
-options: --baud 115200  --tcp-port 8010  --allow 10.54.5.139,127.0.0.1  --write 1
+options: --baud 115200  --tcp-port 8010  --allow 10.54.5.139,127.0.0.1  --write 1,5
 needs:   pip install pyserial   (not for --sim)
 One-time firewall rule on the laser-lab PC (admin PowerShell):
     New-NetFirewallRule -DisplayName "QC bridge 8010" -Direction Inbound -Protocol TCP `
@@ -40,7 +40,7 @@ ap.add_argument("--baud", type=int, default=115200)
 ap.add_argument("--tcp-port", type=int, default=8010)
 ap.add_argument("--listen", default="0.0.0.0")
 ap.add_argument("--allow", default="10.54.5.139,127.0.0.1", help="comma list of client IPs")
-ap.add_argument("--write", default="1", help="comma list of writable pulse numbers (1 = A)")
+ap.add_argument("--write", default="1,5", help="comma list of writable pulse numbers (1 = A, 5 = E)")
 ap.add_argument("--sim", action="store_true", help="emulate a QC (no hardware)")
 args = ap.parse_args()
 
@@ -55,7 +55,7 @@ class SimQc:
     """Tiny emulator: 4 channels, 50 Hz T0, replies like the real 9514+."""
     def __init__(self):
         self.ch = {n: {"STATE": "0", "DELAY": 0.0, "WIDT": 1e-6, "POL": "NORM", "SYNC": "T0",
-                       "CMOD": "NORM", "PCO": "1", "OCO": "0"} for n in "1234"}
+                       "CMOD": "NORM", "PCO": "1", "OCO": "0"} for n in "12345678"}
 
     def query(self, c):
         if c == "*IDN?":
@@ -182,7 +182,7 @@ if __name__ == "__main__":
     if idn.startswith("?"):
         print("[qc_bridge] WARNING: the QC did not answer *IDN? - wrong COM port, or QC_GUI.py still open?")
     print(f"[qc_bridge] listening on {args.listen}:{args.tcp_port}; clients {sorted(ALLOW)}; "
-          f"writable pulses {sorted(WRITABLE)} (1 = A). Ctrl+C to stop.")
+          f"writable pulses {sorted(WRITABLE)} (1 = A, 5 = E). Ctrl+C to stop.")
     srv = Server((args.listen, args.tcp_port), Handler)
     try:
         srv.serve_forever()
