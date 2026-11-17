@@ -534,9 +534,15 @@ class SurveySweeper(threading.Thread):
                         (bound - anchor_wn) / float(self.cfg["wn_per_unit"])
                     tgt = min(tgt, pos_bound) if sd > 0 else max(tgt, pos_bound)
                 # re-issue only on meaningful change (avoid MOV spam while the
-                # clamp jitters with wavemeter noise)
+                # clamp jitters with wavemeter noise). 2026-11-17: the threshold
+                # is ~0.02 cm-1 of travel (max 0.002 units). A fixed 0.002 units
+                # was 0.14 cm-1 at wn_per_unit 70 but 0.42 cm-1 at 210 - more
+                # than the distance left to a bound, so near a bound the clamped
+                # target never changed "enough", no new MOV went out and the
+                # survey froze in place (run_20261117_160802_survey at 12625.28).
+                reissue = min(0.002, 0.02 / max(abs(float(self.cfg["wn_per_unit"])), 1e-9))
                 if tgt is not None and (leg_target is None
-                                        or abs(tgt - leg_target) > 0.002):
+                                        or abs(tgt - leg_target) > reissue):
                     leg_target = tgt
                     self.laser.MOV(leg_target)
             except Exception as e:
@@ -595,7 +601,26 @@ class ParkController(threading.Thread):
         poke = poke_min
         out_since = None            # wall time the laser left the deadband
         approach_ok = 0.0           # earliest time for the next coarse slew
-        appr_gain, appr_last_err = 1.0, None   # stiction escalation (2026-10-30)
+        appr_gain, appr_last_err = 1.0, None   # (kept for the log; see 2026-11-17)
+        # 2026-11-17: backlash-aware approach. After a direction reversal the
+        # drive takes up its slack (~0.01-0.03 stage units = 2-6 cm-1 at 210
+        # cm-1/unit) before the grating moves. The old loop saw those slews as
+        # "stuck", DOUBLED the gain up to 8 and, once the slack was taken, all
+        # the extra travel came out at once (12624.85 -> 12621 drops, +/-5 cm-1
+        # ping-pong; reproduced in an offline plant sim). Now:
+        #   * stuck -> creep by at most park_creep units per slew (no doubling),
+        #     so the overshoot when the gear engages is <= one creep step;
+        #   * the slack taken up after each reversal is MEASURED (motor travel
+        #     until wn moves) and 80 % of the learned value is added to the first
+        #     slew of the next reversal (starts at 0: never over-compensates);
+        #   * steps capped at park_step_cap units (was 0.05 = ~10 cm-1).
+        last_dir = 0                # stage direction of the last commanded move
+        bl_est = float(self.cfg.get("park_backlash_init", 0.0))   # learned slack (units)
+        bl_frac = float(self.cfg.get("park_backlash_frac", 0.85))
+        creep = float(self.cfg.get("park_creep", 0.002))          # units (~0.4 cm-1 at 210)
+        step_cap = float(self.cfg.get("park_step_cap", 0.012))    # units (~2.5 cm-1 at 210)
+        rev_pos = None              # motor position when the current direction started
+        last_move = None            # (err before, stage dir, motor pos after the move)
         # 2026-11-13: wait for each MOV to FINISH before measuring again. The old
         # fixed wait (|step|/burst_v + 3 wm periods) was shorter than the real
         # move (a 2 cm-1 slew took 13-17 s), so the controller re-measured
@@ -688,29 +713,49 @@ class ParkController(threading.Thread):
                         # slew moved wn by < 30% of what it asked for (same
                         # direction), double the gain (cap 8); reset it as
                         # soon as a slew works or the direction flips.
-                        if (appr_last_err is not None
-                                and np.sign(err) == np.sign(appr_last_err[0])
-                                and abs(appr_last_err[0] - err)
-                                < 0.3 * 0.8 * abs(appr_last_err[1])):
-                            appr_gain = min(appr_gain * 2.0, 8.0)
-                        else:
-                            appr_gain = 1.0
+                        slope = float(self.cfg["wn_per_unit"])
+                        base = float(np.clip(0.8 * aim / slope, -step_cap, step_cap))
+                        sdir = 1 if base > 0 else -1
+                        stuck = False
+                        if last_move is not None:
+                            # wn change produced by the last move, along that move's direction
+                            moved = (last_move[0] - err) * last_move[1] * (1 if slope > 0 else -1)
+                            worked = moved >= 0.3 * abs(last_move[3])
+                            stuck = (not worked) and last_move[1] == sdir
+                            if worked and rev_pos is not None:
+                                # first real motion since a reversal: learn the slack
+                                eaten = abs(last_move[2] - rev_pos) - max(moved, 0.0) / abs(slope)
+                                eaten = float(np.clip(eaten, 0.0, 0.05))
+                                bl_est = eaten if bl_est == 0.0 else 0.5 * (bl_est + eaten)
+                                print(f"[Park] backlash learned: {eaten:.4f} units (estimate {bl_est:.4f})")
+                                rev_pos = None
+                        appr_gain = 2.0 if stuck else 1.0
                         appr_last_err = (err, aim)
-                        step = appr_gain * 0.8 * aim / float(self.cfg["wn_per_unit"])
-                        step = float(np.clip(step, -0.05, 0.05))
+                        # creep no bigger than ~2x the proportional step (min park_creep_min)
+                        # so the overshoot when the gear engages scales with the error
+                        c = min(creep, max(float(self.cfg.get("park_creep_min", 0.0005)), 2.0 * abs(base)))
+                        step = sdir * max(abs(base), c) if stuck else base
+                        reversal = last_dir != 0 and sdir != last_dir
+                        if reversal:
+                            step += sdir * bl_frac * bl_est   # take up the learned slack
+                        last_dir = sdir
                         try:
                             try:
                                 self.laser.VEL(burst_v)
                             except Exception:
                                 pass
                             pos = self.laser.qPOS()
+                            if reversal:
+                                rev_pos = pos
                             self.laser.MOV(pos + step)
+                            last_move = (err, sdir, pos + step, 0.8 * aim)
                             buf.clear()
                             self.last_nudge = now
                             moving = (pos + step, now, None, 0)
                             approach_ok = now + abs(step) / burst_v   # (estimate, for the log)
                             print(f"[Park] approach{' (overshoot, lurchy side)' if lurchy else ''}: wn={avg:.5f} "
-                                  f"err={err:+.4f} aim={aim:+.4f} -> slew {step:+.5f} (gain {appr_gain:g}) "
+                                  f"err={err:+.4f} aim={aim:+.4f} -> slew {step:+.5f}"
+                                  f"{' (creep, stuck)' if stuck else ''}{' (+slack %.4f)' % (bl_frac * bl_est) if reversal and bl_est else ''} "
                                   f"(move ~{approach_ok - now:.0f}s, then re-measure)")
                         except Exception as e:
                             print(f"[Park] laser I/O error: {e}")
@@ -729,6 +774,10 @@ class ParkController(threading.Thread):
                             (1.0 if self.cfg["wn_per_unit"] >= 0 else -1.0)
                         if wn_dir != int(self.cfg["preferred_wn_dir"]):
                             step *= 0.5  # extra conservative on the lurchy side
+                        sdir = 1 if step > 0 else -1
+                        if last_dir != 0 and sdir != last_dir:
+                            step += sdir * bl_frac * bl_est
+                        last_dir, last_move, rev_pos = sdir, None, None
                         try:
                             pos = self.laser.qPOS()
                             self.laser.MOV(pos + step)
