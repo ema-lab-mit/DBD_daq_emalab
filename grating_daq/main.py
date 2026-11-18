@@ -159,6 +159,7 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
         self.lbl_live = QtWidgets.QLabel("park live time: ---")
         self.lbl_folder = QtWidgets.QLabel("data: ---")
         self.lbl_folder.setWordWrap(True)
+        self.lbl_wn.setWordWrap(True)
         for w in (self.lbl_status, self.lbl_wn, self.lbl_events, self.lbl_rate,
                   self.lbl_gate, self.lbl_dir, self.lbl_live, self.lbl_folder):
             panel.addWidget(w)
@@ -357,6 +358,8 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
             park_target = self.state.park_target
             park_active = self.state.park_active
             park_live = self.state.park_live_s
+            wm_stale = self.state.wm_stale
+            wm_stale_since = self.state.wm_stale_since
 
         # ToF display: rebin the fine base histogram so ~100 bins span the
         # current gate (finer gate -> finer ToF display).
@@ -392,6 +395,18 @@ class GratingDAQWindow(QtWidgets.QMainWindow):
             self.rate_curve.setData(np.asarray(ts) - t0, np.asarray(rs))
 
         self.lbl_wn.setText(f"wn: {wn:.5f}" if np.isfinite(wn) else "wn: ---")
+        # 2026-11-18: frozen-wavemeter warning (+ markers.csv entries)
+        if wm_stale:
+            self.lbl_wn.setText(
+                f"wn: {wn:.5f}  -- WAVEMETER FROZEN {time.time() - (wm_stale_since or time.time()):.0f} s: "
+                f"laser held, spectrum paused (check the WLM on the laser-lab PC)")
+            self.lbl_wn.setStyleSheet("color: white; background: #c0392b; font-weight: bold")
+        else:
+            self.lbl_wn.setStyleSheet("")
+        if wm_stale != getattr(self, "_wm_stale_prev", False) and self.recorder is not None:
+            self.recorder.add_marker("wavemeter_frozen" if wm_stale else "wavemeter_recovered",
+                                     f"{wm_stale_since if wm_stale else time.time():.1f}")
+        self._wm_stale_prev = wm_stale
         self.lbl_events.setText(f"events: {total} (gated {gtot})")
         if rate_trace:
             self.lbl_rate.setText(f"gated rate: {rate_trace[-1][1]:.1f} /s")

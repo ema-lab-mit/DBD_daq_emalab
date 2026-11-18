@@ -64,6 +64,7 @@
             "poll_interval": 0.2,
             "wavechannel": 3,
             "wn_per_unit": 210,
+            "survey_wn_per_unit": 70,
             "backlash": 0.02,
             "sweep_step": 0.001,
             "crawl": true,

@@ -167,6 +167,11 @@ class SharedState:
         self.wm_period = 0.1              # rolling median wavemeter update period (s)
         self.wn_v_est = 0.0               # cm-1/s from the last two CHANGED readings
         self.wn_change_t = 0.0            # wall time of the last CHANGED reading
+        # 2026-11-18: frozen-wavemeter guard. The WLM can stop measuring while its
+        # IOC keeps republishing the last value (run_20261118_093141_survey: 160 s
+        # of one value on every channel; normal runs never repeat a value > 2 s).
+        self.wm_stale = False             # no new wavemeter value for wm_stale_s
+        self.wm_stale_since = None        # wall time of the last fresh value
         # Events waiting for wn assignment: (timestamp, tof_bin or -1). The
         # collector queues them and WnPoller retro-bins each batch along the
         # SAME interpolated wn path used for dwell, so the live spectrum's
@@ -232,6 +237,7 @@ class WnPoller(threading.Thread):
         self.state = None
         self.pv = cfg["wm_pv"]
         self.poll = float(cfg["wn_poll_s"])
+        self.stale_s = float(cfg.get("wm_stale_s", 15.0))
         self.stop_event = threading.Event()
         # Median filter for the park in/out-of-band decision: raw wavemeter
         # jitter (~+/-0.003) is comparable to the deadband, so single-sample
@@ -320,6 +326,22 @@ class WnPoller(threading.Thread):
                                     state.hist2d[i, ti] += 1
                     state.wn_change_t = now
                     prev_val, prev_t = wn, now
+                # Frozen-wavemeter guard (2026-11-18): no fresh value for
+                # stale_s -> flag it; laser moves are held (Park/Survey check
+                # state.wm_stale) and nothing is credited to the live spectrum.
+                last_ok = state.wn_change_t if state.wn_change_t > 0 else state.start_time
+                stale = (now - last_ok) > self.stale_s
+                if stale and not state.wm_stale:
+                    state.wm_stale, state.wm_stale_since = True, last_ok
+                    print(f"[WnPoller] WAVEMETER FROZEN: no new value for {now - last_ok:.0f} s "
+                          f"(stuck at {wn}) -> holding laser moves, not crediting the spectrum")
+                elif not stale and state.wm_stale:
+                    print(f"[WnPoller] wavemeter updating again after "
+                          f"{now - (state.wm_stale_since or now):.0f} s")
+                    state.wm_stale, state.wm_stale_since = False, None
+                if stale:
+                    state.pending.clear()      # (still in events.csv with the frozen wn)
+                    plateau_credited_until = now
                 elif np.isfinite(wn) and dt_ok and (now - prev_t) > PLATEAU_S:
                     # true plateau (parked/stuck long): credit directly
                     i = state.bin_of(wn)
@@ -336,7 +358,9 @@ class WnPoller(threading.Thread):
                 # the MEDIAN of the last few readings (jitter immunity) with
                 # hysteresis: enter at the deadband, leave only at 1.5x, so
                 # noise at the edge doesn't chatter the live gate.
-                if state.park_target is not None:
+                if state.park_target is not None and stale:
+                    state.park_active = False      # a frozen reading is not "in band"
+                elif state.park_target is not None:
                     if np.isfinite(wn):
                         self._park_buf.append(wn)
                     if self._park_buf:
@@ -370,6 +394,17 @@ class SurveySweeper(threading.Thread):
     def _stage_dir(self, wn_dir: int) -> float:
         slope_sign = 1.0 if self.cfg["wn_per_unit"] >= 0 else -1.0
         return wn_dir * slope_sign
+
+    def _k(self) -> float:
+        """Slope used by the SURVEY (2026-11-18). Parks need wn_per_unit ~210 (small slews), but
+        the survey's bound clamp / margin / MOV cadence ran for weeks at 70; at 210 the clamp let the
+        motor lead the grating by only (bound - wn)/210 units, less than the stage's wind-up, and the
+        11-18 surveys sat 40-70 s at a time (run_20261118_145505_survey). survey_wn_per_unit in the
+        settings.json grating section overrides wn_per_unit here; same sign required."""
+        k = float(self.cfg.get("survey_wn_per_unit", self.cfg["wn_per_unit"]))
+        if np.sign(k) != np.sign(float(self.cfg["wn_per_unit"])):
+            k = float(self.cfg["wn_per_unit"])
+        return k
 
     def _leg(self, wn_dir: int) -> float:
         leg = float(self.cfg["survey_leg"])
@@ -428,14 +463,32 @@ class SurveySweeper(threading.Thread):
         anchor_pos = None
         anchor_wn = float("nan")
         last_anchor_t = -1.0
+        held = False
         while not self.stop_event.is_set():
             with self.state.lock:
                 wn = self.state.wn
                 wm_period = self.state.wm_period
                 v_est = self.state.wn_v_est
                 chg_t = self.state.wn_change_t
+                stale = self.state.wm_stale
                 self.state.sweep_dir = wn_dir
             now = time.time()
+            if stale:
+                # 2026-11-18: no wavemeter feedback -> stop the stage where it is
+                if not held:
+                    held = True
+                    try:
+                        self.laser.MOV(self.laser.qPOS())
+                    except Exception as e:
+                        print(f"[Survey] hold MOV failed: {e}")
+                    print("[Survey] wavemeter frozen -> stage held until it updates")
+                self.stop_event.wait(loop_s)
+                continue
+            if held:
+                held = False
+                leg_target = None          # re-issue the glide from here
+                anchor_pos = None
+                print("[Survey] wavemeter back -> resuming the sweep")
             if np.isfinite(wn):
                 # Slow-wavemeter support: the latest reading can be up to
                 # wm_period stale, and this loop adds up to 1 s more. Predict
@@ -443,7 +496,7 @@ class SurveySweeper(threading.Thread):
                 # stale edge check cannot overshoot the survey bounds.
                 age = min(max(now - chg_t, 0.0), 3.0 * max(wm_period, 0.1))
                 wn_pred = wn + v_est * age
-                cur_v = (burst_v if bursting else scan_v) * abs(float(self.cfg["wn_per_unit"]))
+                cur_v = (burst_v if bursting else scan_v) * abs(self._k())
                 # stick-slip: the measured slip velocity can exceed the
                 # commanded one several-fold -- use whichever is larger
                 eff_v = max(cur_v, abs(v_est))
@@ -531,7 +584,7 @@ class SurveySweeper(threading.Thread):
                 if anchor_pos is not None and np.isfinite(anchor_wn):
                     bound = self.wn_hi if wn_dir > 0 else self.wn_lo
                     pos_bound = anchor_pos + \
-                        (bound - anchor_wn) / float(self.cfg["wn_per_unit"])
+                        (bound - anchor_wn) / self._k()
                     tgt = min(tgt, pos_bound) if sd > 0 else max(tgt, pos_bound)
                 # re-issue only on meaningful change (avoid MOV spam while the
                 # clamp jitters with wavemeter noise). 2026-11-17: the threshold
@@ -540,7 +593,9 @@ class SurveySweeper(threading.Thread):
                 # than the distance left to a bound, so near a bound the clamped
                 # target never changed "enough", no new MOV went out and the
                 # survey froze in place (run_20261117_160802_survey at 12625.28).
-                reissue = min(0.002, 0.02 / max(abs(float(self.cfg["wn_per_unit"])), 1e-9))
+                # 2026-11-18: with the survey slope (survey_wn_per_unit, 70) this is the
+                # pre-11-17 0.002 units again; 0.14 cm-1 only bites at larger slopes.
+                reissue = min(0.002, 0.14 / max(abs(self._k()), 1e-9))
                 if tgt is not None and (leg_target is None
                                         or abs(tgt - leg_target) > reissue):
                     leg_target = tgt
@@ -634,10 +689,26 @@ class ParkController(threading.Thread):
             self.state.park_deadband = deadband
         print(f"[Park] holding {self.target_wn:.5f} (deadband +/-{deadband}; "
               f"freeze-in-band, poke only after {settle:.0f}s out)")
+        held = False
         while not self.stop_event.is_set():
             with self.state.lock:
                 wn = self.state.wn
+                stale = self.state.wm_stale
                 self.state.sweep_dir = 0
+            if stale and moving is None:
+                # 2026-11-18: a frozen reading looks like a stuck grating; the
+                # creep would then walk the stage away blind. Hold instead.
+                if not held:
+                    held = True
+                    print("[Park] wavemeter frozen -> holding (no moves) until it updates")
+                buf.clear()
+                last_move = None
+                self.stop_event.wait(0.3)
+                continue
+            if held and not stale:
+                held = False
+                approach_ok = time.time() + 2.0
+                print("[Park] wavemeter back -> park control resumed")
             if moving is not None:
                 now = time.time()
                 try:
@@ -884,7 +955,7 @@ def load_grating_cfg() -> dict:
     try:
         with open(os.path.join(_REPO, "settings.json")) as f:
             g = json.load(f)["control_settings"].get("grating", {})
-        for k in ("wn_per_unit", "preferred_wn_dir", "reverse_leg_scale",
+        for k in ("wn_per_unit", "survey_wn_per_unit", "preferred_wn_dir", "reverse_leg_scale",
                   "wavechannel"):
             if k in g:
                 cfg[k] = g[k]

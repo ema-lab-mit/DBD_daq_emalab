@@ -84,7 +84,7 @@ plant.g = 0.0       # last move was upward: motor touching the high-side contact
 plant.m = plant.B   # (m - g = B: pushing up)
 
 state = types.SimpleNamespace(lock=threading.Lock(), wn=start_wn, sweep_dir=0, wm_period=0.6,
-                              park_target=None, park_deadband=None)
+                              park_target=None, park_deadband=None, wm_stale=False, wm_stale_since=None)
 WM_LAG, WM_PERIOD = 0.7, 0.6
 hist = []           # (t, true wn)
 next_wm = [0.0]
